@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram TXT File Forwarder - Railway Ready (Fixed Login)
-Login via bot, select channels, auto-forward .txt files
+Telegram TXT File Forwarder - Railway Ready (Fixed Login with Resend)
 """
 
 import os
@@ -13,11 +12,16 @@ import logging
 import traceback
 import requests
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeFilename
-from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError, PhoneCodeInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError, 
+    PhoneCodeExpiredError, 
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError
+)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
@@ -35,7 +39,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SESSION_FILE = os.path.join(DATA_DIR, "user_session.session")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DB_FILE = os.path.join(DATA_DIR, "forwarded.db")
-SCAN_INTERVAL = 300  # 5 minutes
+SCAN_INTERVAL = 300
 
 # ============================================================
 # LOGGING
@@ -69,7 +73,6 @@ def init_db():
     )''')
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
 
 def is_file_forwarded(file_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -120,10 +123,7 @@ def load_config() -> dict:
         "api_id": None,
         "api_hash": None,
         "logged_in": False,
-        "settings": {
-            "forward_to_saved": True,
-            "forward_to_bot": True
-        }
+        "settings": {"forward_to_saved": True, "forward_to_bot": True}
     }
 
 def save_config(config: dict):
@@ -207,27 +207,25 @@ class ForwarderBot:
         api_id, api_hash = get_credentials()
         if not api_id or not api_hash:
             return False
-
         self.client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
         try:
             await self.client.start()
             if await self.client.is_user_authorized():
                 set_logged_in(True)
                 me = await self.client.get_me()
-                logger.info(f"Loaded existing session for: {me.first_name}")
+                logger.info(f"Loaded session: {me.first_name}")
                 return True
         except Exception as e:
             logger.error(f"Failed to load session: {e}")
         return False
 
     async def create_permanent_client(self, api_id: str, api_hash: str):
-        """Create permanent client after successful login"""
         self.client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
         await self.client.start()
         set_logged_in(True)
         me = await self.client.get_me()
         save_credentials(api_id, api_hash)
-        logger.info(f"Created permanent client for: {me.first_name}")
+        logger.info(f"Created permanent client: {me.first_name}")
         return me
 
     async def start_scanner(self):
@@ -241,27 +239,22 @@ class ForwarderBot:
             try:
                 await self.scan_and_forward()
             except Exception as e:
-                logger.error(f"Scanner loop error: {e}")
+                logger.error(f"Scanner error: {e}")
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def scan_and_forward(self):
         if not self.client or not self.client.is_connected():
             return
-
         enabled_channels = get_enabled_channels()
-        if not enabled_channels:
-            return
-
         for channel_info in enabled_channels:
             try:
                 await self._scan_one_channel(channel_info)
             except Exception as e:
-                logger.error(f"Error scanning channel {channel_info.get('name')}: {e}")
+                logger.error(f"Error scanning {channel_info.get('name')}: {e}")
 
     async def _scan_one_channel(self, channel_info: dict):
         channel_id = channel_info["id"]
         channel_name = channel_info["name"]
-
         try:
             channel = await self.client.get_entity(channel_id)
             last_msg_id = get_last_scan(channel_id)
@@ -273,8 +266,8 @@ class ForwarderBot:
             for msg in messages:
                 if last_msg_id is None or msg.id > last_msg_id:
                     if msg.document:
-                        file_name = self._extract_filename(msg)
-                        if file_name and file_name.endswith('.txt'):
+                        fname = self._extract_filename(msg)
+                        if fname and fname.endswith('.txt'):
                             new_files.append(msg)
 
             latest_id = max(m.id for m in messages)
@@ -282,9 +275,8 @@ class ForwarderBot:
 
             for msg in reversed(new_files):
                 await self._process_file(msg, channel_name)
-
         except Exception as e:
-            logger.error(f"Error in channel {channel_name}: {e}")
+            logger.error(f"Error in {channel_name}: {e}")
 
     def _extract_filename(self, msg) -> Optional[str]:
         if msg.document and msg.document.attributes:
@@ -297,35 +289,29 @@ class ForwarderBot:
         file_id = str(msg.document.id)
         if is_file_forwarded(file_id):
             return
-
         file_name = self._extract_filename(msg)
         if not file_name:
             return
 
-        logger.info(f"New .txt file: {file_name} from {channel_name}")
-
+        logger.info(f"New file: {file_name} from {channel_name}")
         temp_path = os.path.join(DATA_DIR, f"temp_{msg.id}_{file_name}")
         try:
             await self.client.download_file(msg.media, temp_path)
             settings = get_settings()
 
             if settings.get("forward_to_saved", True):
-                await self.client.send_file('me', temp_path, caption=f"Forwarded from: {channel_name}\nOriginal message: {msg.id}")
+                await self.client.send_file('me', temp_path, caption=f"From: {channel_name}\nMsg: {msg.id}")
 
             if settings.get("forward_to_bot", True):
                 url = f"https://api.telegram.org/bot{TARGET_BOT_TOKEN}/sendDocument"
                 with open(temp_path, 'rb') as f:
                     files = {'document': (file_name, f)}
-                    data = {
-                        'chat_id': TARGET_CHAT_ID,
-                        'caption': f"📁 {file_name}\n📡 Source: {channel_name}\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    }
+                    data = {'chat_id': TARGET_CHAT_ID, 'caption': f"📁 {file_name}\n📡 {channel_name}"}
                     requests.post(url, data=data, files=files, timeout=30)
 
             mark_file_forwarded(file_id, msg.id, msg.chat_id, file_name)
-
         except Exception as e:
-            logger.error(f"Error processing file {file_name}: {e}")
+            logger.error(f"Error processing {file_name}: {e}")
         finally:
             if os.path.exists(temp_path):
                 try:
@@ -338,18 +324,13 @@ class ForwarderBot:
             return []
         try:
             dialogs = await self.client.get_dialogs()
-            channels = []
-            for dialog in dialogs:
-                if dialog.is_channel:
-                    channels.append({
-                        'id': dialog.id,
-                        'name': dialog.name,
-                        'username': dialog.entity.username if dialog.entity.username else None,
-                    })
-            return channels
+            return [{'id': d.id, 'name': d.name, 'username': d.entity.username} for d in dialogs if d.is_channel]
         except Exception as e:
             logger.error(f"Failed to fetch channels: {e}")
             return []
+
+    async def manual_scan(self):
+        await self.scan_and_forward()
 
     async def shutdown(self):
         self.running = False
@@ -361,26 +342,33 @@ class ForwarderBot:
                 pass
         if self.client:
             await self.client.disconnect()
-        logger.info("ForwarderBot shut down")
 
 # ============================================================
 # LOGIN STATE MANAGEMENT
 # ============================================================
 
 class LoginState:
-    def __init__(self):
+    def __init__(self, user_id: int):
+        self.user_id = user_id
         self.api_id = None
         self.api_hash = None
         self.phone = None
-        self.phone_code_hash = None
-        self.temp_client = None
-        self.step = None
+        self.client = None
+        self.step = "start"  # start -> phone -> code -> password -> done
+        self.password_needed = False
 
-# Store login states per user (in memory)
 login_states: Dict[int, LoginState] = {}
 
+async def cleanup_login_state(user_id: int):
+    state = login_states.pop(user_id, None)
+    if state and state.client:
+        try:
+            await state.client.disconnect()
+        except:
+            pass
+
 # ============================================================
-# TELEGRAM BOT COMMAND HANDLERS
+# COMMAND HANDLERS
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,174 +377,130 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = (
             "🤖 **Telegram TXT File Forwarder**\n\n"
-            "This bot monitors channels and forwards .txt files.\n\n"
-            "**First, you need to log in with your Telegram account:**\n\n"
-            "1. Get your API credentials from https://my.telegram.org/apps\n"
+            "Monitors channels and forwards .txt files.\n\n"
+            "**Login:**\n"
+            "1. Get API creds: https://my.telegram.org/apps\n"
             "2. Send `/login [api_id] [api_hash]`\n\n"
-            "Example: `/login 1234567 abcdef1234567890`\n\n"
-            "⚠️ Your credentials are stored locally and never shared."
+            "Example: `/login 1234567 abcdef1234567890`"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
-    
+
     if len(args) != 2:
         await update.message.reply_text(
-            "❌ **Usage:** `/login [api_id] [api_hash]`\n\n"
-            "Get your credentials from: https://my.telegram.org/apps",
+            "❌ Usage: `/login [api_id] [api_hash]`\nGet credentials from: https://my.telegram.org/apps",
             parse_mode='Markdown'
         )
         return
 
     api_id, api_hash = args[0], args[1]
-    
-    # Create login state for this user
-    state = LoginState()
+
+    # Clean up any existing state
+    await cleanup_login_state(user_id)
+
+    state = LoginState(user_id)
     state.api_id = api_id
     state.api_hash = api_hash
     state.step = "phone"
     login_states[user_id] = state
-    
+
     await update.message.reply_text(
-        "📱 **Please enter your phone number** (with country code)\n\n"
-        "Example: `+1234567890`",
+        "📱 **Enter your phone number** (with country code)\nExample: `+1234567890`\n\n"
+        "Type `/cancel` to abort.",
         parse_mode='Markdown'
     )
+
+async def resend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resend verification code"""
+    user_id = update.effective_user.id
+    state = login_states.get(user_id)
+
+    if not state or state.step not in ["code", "password"]:
+        await update.message.reply_text("❌ No active login session. Use /login to start.")
+        return
+
+    if state.step == "code" and state.client:
+        await update.message.reply_text("🔄 **Requesting new code...**")
+        try:
+            result = await state.client.send_code_request(state.phone)
+            state.phone_code_hash = result.phone_code_hash
+            await update.message.reply_text("✅ **New code sent!**\n\nPlease enter the OTP code:")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to resend: {str(e)}")
+    else:
+        await update.message.reply_text("❌ Cannot resend code at this step.")
+
+async def cancel_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel current login session"""
+    user_id = update.effective_user.id
+    await cleanup_login_state(user_id)
+    await update.message.reply_text("✅ **Login cancelled.** Use /login to start over.")
 
 async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = login_states.get(user_id)
-    
+
     if not state:
         return
-    
+
     text = update.message.text.strip()
-    
+
     if state.step == "phone":
         state.phone = text
-        state.step = "requesting_code"
-        
+        state.step = "requesting"
+
         await update.message.reply_text("🔄 **Requesting verification code...**")
-        
-        # Create temporary client and request code
+
         try:
-            state.temp_client = TelegramClient(None, int(state.api_id), state.api_hash)
-            await state.temp_client.connect()
-            
-            result = await state.temp_client.send_code_request(state.phone)
+            state.client = TelegramClient(None, int(state.api_id), state.api_hash)
+            await state.client.connect()
+
+            result = await state.client.send_code_request(state.phone)
             state.phone_code_hash = result.phone_code_hash
             state.step = "code"
-            
+
             await update.message.reply_text(
                 "✅ **Code sent!**\n\n"
-                "Please enter the OTP code you received in Telegram:\n"
-                "(e.g., `12345`)",
+                "Enter the OTP code from Telegram:\n"
+                "Type `/resend` if you don't receive it.\n"
+                "Type `/cancel` to abort.",
                 parse_mode='Markdown'
             )
-            
+
+        except PhoneNumberInvalidError:
+            await update.message.reply_text("❌ Invalid phone number. Please try again.")
+            state.step = "phone"
         except Exception as e:
-            await update.message.reply_text(f"❌ **Error:** {str(e)}", parse_mode='Markdown')
+            await update.message.reply_text(f"❌ Error: {str(e)}")
             await cleanup_login_state(user_id)
-    
+
     elif state.step == "code":
         code = text
-        await update.message.reply_text("🔄 **Verifying code...**")
-        
+        await update.message.reply_text("🔄 **Verifying...**")
+
         try:
-            # Attempt to sign in with the code
-            await state.temp_client.sign_in(state.phone, code, phone_code_hash=state.phone_code_hash)
-            
-            # Check if authorized
-            if await state.temp_client.is_user_authorized():
-                # Login successful!
-                me = await state.temp_client.get_me()
-                
-                # Create permanent client and save session
-                await state.temp_client.disconnect()
-                
-                forwarder = ForwarderBot()
-                await forwarder.create_permanent_client(state.api_id, state.api_hash)
-                await forwarder.start_scanner()
-                
-                # Store in bot_data
-                context.bot_data['forwarder'] = forwarder
-                
-                await update.message.reply_text(
-                    f"✅ **Login successful!**\n\n"
-                    f"Welcome, {me.first_name}! (@{me.username or 'no username'})\n\n"
-                    f"Now fetching your channels...",
-                    parse_mode='Markdown'
-                )
-                
-                # Fetch channels
-                channels = await forwarder.fetch_channels()
-                if channels:
-                    clear_channels()
-                    for ch in channels:
-                        add_channel(ch['id'], ch['name'], enabled=True)
-                    await show_channel_selection(update, channels, context)
-                else:
-                    await update.message.reply_text("📭 No channels found. Make sure you're a member of some channels.")
-                
-                # Cleanup login state
-                await cleanup_login_state(user_id)
-                
-            else:
-                await update.message.reply_text("❌ Login failed. Please try again.")
-                await cleanup_login_state(user_id)
-                
-        except SessionPasswordNeededError:
-            state.step = "password"
-            await update.message.reply_text(
-                "🔐 **2FA Enabled**\n\n"
-                "Please enter your Telegram 2FA password:",
-                parse_mode='Markdown'
-            )
-            
-        except PhoneCodeInvalidError:
-            await update.message.reply_text(
-                "❌ **Invalid code**\n\n"
-                "Please enter the correct OTP code:",
-                parse_mode='Markdown'
-            )
-            
-        except PhoneCodeExpiredError:
-            await update.message.reply_text(
-                "❌ **Code expired**\n\n"
-                "Please restart login with /login",
-                parse_mode='Markdown'
-            )
-            await cleanup_login_state(user_id)
-            
-        except Exception as e:
-            await update.message.reply_text(f"❌ **Error:** {str(e)}", parse_mode='Markdown')
-            await cleanup_login_state(user_id)
-    
-    elif state.step == "password":
-        password = text
-        await update.message.reply_text("🔄 **Verifying password...**")
-        
-        try:
-            await state.temp_client.sign_in(password=password)
-            
-            if await state.temp_client.is_user_authorized():
-                me = await state.temp_client.get_me()
-                await state.temp_client.disconnect()
-                
+            await state.client.sign_in(state.phone, code, phone_code_hash=state.phone_code_hash)
+
+            if await state.client.is_user_authorized():
+                me = await state.client.get_me()
+                await state.client.disconnect()
+
+                # Create permanent client
                 forwarder = ForwarderBot()
                 await forwarder.create_permanent_client(state.api_id, state.api_hash)
                 await forwarder.start_scanner()
                 context.bot_data['forwarder'] = forwarder
-                
+
                 await update.message.reply_text(
                     f"✅ **Login successful!**\n\n"
                     f"Welcome, {me.first_name}! (@{me.username or 'no username'})\n\n"
-                    f"Now fetching your channels...",
+                    f"Fetching your channels...",
                     parse_mode='Markdown'
                 )
-                
+
                 channels = await forwarder.fetch_channels()
                 if channels:
                     clear_channels()
@@ -565,24 +509,82 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await show_channel_selection(update, channels, context)
                 else:
                     await update.message.reply_text("📭 No channels found.")
-                
+
                 await cleanup_login_state(user_id)
+
             else:
                 await update.message.reply_text("❌ Login failed.")
                 await cleanup_login_state(user_id)
-                
+
+        except SessionPasswordNeededError:
+            state.step = "password"
+            state.password_needed = True
+            await update.message.reply_text(
+                "🔐 **2FA Enabled**\n\n"
+                "Enter your Telegram 2FA password:\n"
+                "Type `/cancel` to abort.",
+                parse_mode='Markdown'
+            )
+
+        except PhoneCodeInvalidError:
+            await update.message.reply_text(
+                "❌ **Invalid code**\n\n"
+                "Try again, or type `/resend` for a new code:",
+                parse_mode='Markdown'
+            )
+
+        except PhoneCodeExpiredError:
+            await update.message.reply_text(
+                "❌ **Code expired**\n\n"
+                "Type `/resend` to get a new code:",
+                parse_mode='Markdown'
+            )
+
         except Exception as e:
-            await update.message.reply_text(f"❌ **Error:** {str(e)}", parse_mode='Markdown')
+            await update.message.reply_text(f"❌ Error: {str(e)}")
             await cleanup_login_state(user_id)
 
-async def cleanup_login_state(user_id: int):
-    state = login_states.pop(user_id, None)
-    if state and state.temp_client:
+    elif state.step == "password":
+        password = text
+        await update.message.reply_text("🔄 **Verifying password...**")
+
         try:
-            if state.temp_client.is_connected():
-                await state.temp_client.disconnect()
-        except:
-            pass
+            await state.client.sign_in(password=password)
+
+            if await state.client.is_user_authorized():
+                me = await state.client.get_me()
+                await state.client.disconnect()
+
+                forwarder = ForwarderBot()
+                await forwarder.create_permanent_client(state.api_id, state.api_hash)
+                await forwarder.start_scanner()
+                context.bot_data['forwarder'] = forwarder
+
+                await update.message.reply_text(
+                    f"✅ **Login successful!**\n\n"
+                    f"Welcome, {me.first_name}! (@{me.username or 'no username'})\n\n"
+                    f"Fetching your channels...",
+                    parse_mode='Markdown'
+                )
+
+                channels = await forwarder.fetch_channels()
+                if channels:
+                    clear_channels()
+                    for ch in channels:
+                        add_channel(ch['id'], ch['name'], enabled=True)
+                    await show_channel_selection(update, channels, context)
+                else:
+                    await update.message.reply_text("📭 No channels found.")
+
+                await cleanup_login_state(user_id)
+
+            else:
+                await update.message.reply_text("❌ Login failed.")
+                await cleanup_login_state(user_id)
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await cleanup_login_state(user_id)
 
 async def show_channel_selection(update: Update, channels: List[dict], context: ContextTypes.DEFAULT_TYPE):
     if not channels:
@@ -607,7 +609,7 @@ async def show_channel_selection(update: Update, channels: List[dict], context: 
     await update.message.reply_text(
         f"📋 **Select Channels to Monitor**\n\n"
         f"Found {len(channels)} channels.\n"
-        f"Tap to toggle monitoring on/off.\n\n"
+        f"Tap to toggle on/off.\n\n"
         f"✅ = Active | ⏸️ = Disabled",
         reply_markup=reply_markup,
         parse_mode='Markdown'
@@ -622,13 +624,13 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"✅ **Logged In**\n\n"
         f"📡 **Channels:** {enabled_count}/{total_count} active\n"
-        f"📁 **Scan Interval:** {SCAN_INTERVAL // 60} minutes\n"
-        f"📤 **Forward to Saved:** {'ON' if settings.get('forward_to_saved', True) else 'OFF'}\n"
-        f"🤖 **Forward to Bot:** {'ON' if settings.get('forward_to_bot', True) else 'OFF'}\n\n"
+        f"📁 **Scan Interval:** {SCAN_INTERVAL // 60} min\n"
+        f"📤 **Saved:** {'ON' if settings.get('forward_to_saved', True) else 'OFF'}\n"
+        f"🤖 **Bot:** {'ON' if settings.get('forward_to_bot', True) else 'OFF'}\n\n"
         f"**Commands:**\n"
         f"/channels - Manage channels\n"
-        f"/settings - Change forwarding settings\n"
-        f"/status - View statistics\n"
+        f"/settings - Change settings\n"
+        f"/status - View stats\n"
         f"/scan - Manual scan\n"
         f"/logout - Log out"
     )
@@ -641,7 +643,7 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     channels = get_all_channels()
     if not channels:
-        await update.message.reply_text("📭 No channels configured. Please log in again to fetch channels.")
+        await update.message.reply_text("📭 No channels configured.")
         return
 
     keyboard = []
@@ -656,49 +658,32 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "📋 **Your Channels**\n\nTap to toggle monitoring on/off:",
+        "📋 **Your Channels**\n\nTap to toggle monitoring:",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_logged_in():
-        await update.message.reply_text("❌ Please login first using /login")
+        await update.message.reply_text("❌ Please login first")
         return
 
     settings = get_settings()
-
     keyboard = [
-        [
-            InlineKeyboardButton(
-                f"📤 Saved: {'ON' if settings.get('forward_to_saved', True) else 'OFF'}",
-                callback_data="toggle_saved"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"🤖 Bot: {'ON' if settings.get('forward_to_bot', True) else 'OFF'}",
-                callback_data="toggle_bot"
-            )
-        ],
+        [InlineKeyboardButton(f"📤 Saved: {'ON' if settings.get('forward_to_saved', True) else 'OFF'}", callback_data="toggle_saved")],
+        [InlineKeyboardButton(f"🤖 Bot: {'ON' if settings.get('forward_to_bot', True) else 'OFF'}", callback_data="toggle_bot")],
         [InlineKeyboardButton("🔄 Manual Scan", callback_data="manual_scan")],
         [InlineKeyboardButton("Close", callback_data="close")]
     ]
-
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "⚙️ **Settings**\n\nSelect an option to toggle:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("⚙️ **Settings**", reply_markup=reply_markup, parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_logged_in():
-        await update.message.reply_text("❌ Please login first using /login")
+        await update.message.reply_text("❌ Please login first")
         return
 
     enabled_count = len(get_enabled_channels())
-
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM forwarded_files")
@@ -708,16 +693,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     forwarder = context.bot_data.get('forwarder')
-    scanner_status = "Running" if forwarder and forwarder.running else "Not started"
+    scanner = "Running" if forwarder and forwarder.running else "Idle"
 
-    msg = (
-        f"📊 **Status**\n\n"
-        f"📡 **Active Channels:** {enabled_count}\n"
-        f"📁 **Files Forwarded:** {total} total, {today} today\n"
-        f"⏱️ **Scan Interval:** {SCAN_INTERVAL // 60} minutes\n"
-        f"🤖 **Scanner:** {scanner_status}\n\n"
-        f"Use /scan to trigger manual scan."
-    )
+    msg = f"📊 **Status**\n\n📡 Active Channels: {enabled_count}\n📁 Files Forwarded: {total} total, {today} today\n⏱️ Scan: every {SCAN_INTERVAL // 60} min\n🤖 Scanner: {scanner}"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -729,20 +707,18 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_logged_in(False)
     clear_channels()
     context.bot_data.pop('forwarder', None)
-    await update.message.reply_text(
-        "✅ **Logged out**\n\nYour session has been cleared.\nUse /login to log in again."
-    )
+    await update.message.reply_text("✅ **Logged out**\n\nUse /login to log in again.")
 
 async def manual_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_logged_in():
-        await update.message.reply_text("❌ Please login first using /login")
+        await update.message.reply_text("❌ Please login first")
         return
     forwarder = context.bot_data.get('forwarder')
     if forwarder:
         await update.message.reply_text("🔄 Manual scan triggered...")
         asyncio.create_task(forwarder.manual_scan())
     else:
-        await update.message.reply_text("❌ Forwarder not initialized. Please login again.")
+        await update.message.reply_text("❌ Forwarder not initialized.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -759,32 +735,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         toggle_channel_enabled(channel_id)
         channels = get_all_channels()
         enabled_ids = {ch["id"] for ch in channels if ch.get("enabled", True)}
-        
         keyboard = []
         for ch in channels:
             status = "✅" if ch['id'] in enabled_ids else "⏸️"
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{status} {ch['name'][:35]}",
-                    callback_data=f"sel_{ch['id']}"
-                )
-            ])
+            keyboard.append([InlineKeyboardButton(f"{status} {ch['name'][:35]}", callback_data=f"sel_{ch['id']}")])
         keyboard.append([InlineKeyboardButton("✅ Confirm Selection", callback_data="confirm_channels")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            f"📋 **Select Channels to Monitor**\n\n"
-            f"Found {len(channels)} channels.\n"
-            f"Tap to toggle monitoring on/off.\n\n"
-            f"✅ = Active | ⏸️ = Disabled",
-            reply_markup=reply_markup,
+            f"📋 Select Channels\n\nFound {len(channels)} channels.\nTap to toggle.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
 
     elif data == "confirm_channels":
-        await query.edit_message_text(
-            "✅ **Channels saved!**\n\nMonitoring will now begin.\n\nUse /status to check progress."
-        )
+        await query.edit_message_text("✅ **Channels saved!**\n\nMonitoring will begin.\nUse /status to check.")
 
     elif data == "toggle_saved":
         current = get_settings().get("forward_to_saved", True)
@@ -813,9 +776,11 @@ async def main():
     init_db()
 
     app = Application.builder().token(COMMAND_BOT_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("resend", resend_command))
+    app.add_handler(CommandHandler("cancel", cancel_login_command))
     app.add_handler(CommandHandler("channels", channels_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -824,16 +789,15 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Try to restore previous session
     forwarder = ForwarderBot()
     if await forwarder.initialize_from_session():
         await forwarder.start_scanner()
         app.bot_data['forwarder'] = forwarder
-        logger.info("Restored previous session and started scanner")
+        logger.info("Restored session")
     else:
-        logger.info("No valid session, waiting for user login")
+        logger.info("No session, waiting for login")
 
-    logger.info("Command bot started")
+    logger.info("Bot started")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -841,7 +805,7 @@ async def main():
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        pass
     finally:
         await app.stop()
         if 'forwarder' in app.bot_data:
