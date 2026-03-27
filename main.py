@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+l#!/usr/bin/env python3
 """
-Telegram Channel TXT File Forwarder
-Monitors selected channels and forwards .txt files to Saved Messages and target bot
+Telegram TXT File Forwarder - Railway Ready
+Login via bot, select channels, auto-forward .txt files
 """
 
 import os
@@ -10,37 +10,37 @@ import json
 import asyncio
 import sqlite3
 import logging
+import threading
+import time
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Set
-import traceback
+from pathlib import Path
 
-from telethon import TelegramClient, events
-from telethon.tl.types import MessageMediaDocument, DocumentAttributeFilename, Message
-from telethon.tl.functions.messages import GetHistoryRequest
+from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeFilename
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, RPCError
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Bot tokens (for sending forwarded files)
+COMMAND_BOT_TOKEN = "8666320518:AAEIhkSS0XeJ-k40rc3d80Dn0b-q9JLcnyI"
 TARGET_BOT_TOKEN = "8657130802:AAE8Ynf791ramxyFktFPHgwuv0b5vNKiKH0"
 TARGET_CHAT_ID = "8260250818"
 
-# Main bot token (for user commands)
-COMMAND_BOT_TOKEN = "8666320518:AAEIhkSS0XeJ-k40rc3d80Dn0b-q9JLcnyI"
-
-# Files
-SESSION_FILE = "user_session.session"
-CONFIG_FILE = "config.json"
-DB_FILE = "forwarded.db"
-
-# Scan interval (seconds)
+FILES_DIR = "/app/data" if os.path.exists("/app") else "data"
+SESSION_FILE = os.path.join(FILES_DIR, "user_session.session")
+CONFIG_FILE = os.path.join(FILES_DIR, "config.json")
+DB_FILE = os.path.join(FILES_DIR, "forwarded.db")
 SCAN_INTERVAL = 300  # 5 minutes
 
+# Create data directory
+os.makedirs(FILES_DIR, exist_ok=True)
+
 # ============================================================
-# LOGGING SETUP
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -50,37 +50,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# DATABASE SETUP (Deduplication)
+# DATABASE
 # ============================================================
 
 def init_db():
-    """Initialize SQLite database for tracking forwarded files"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS forwarded_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT UNIQUE,
-            message_id INTEGER,
-            channel_id INTEGER,
-            file_name TEXT,
-            forwarded_at TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS last_scan (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id INTEGER,
-            last_message_id INTEGER,
-            last_scan_time TIMESTAMP
-        )
-    ''')
+    c.execute('''CREATE TABLE IF NOT EXISTS forwarded_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT UNIQUE,
+        message_id INTEGER,
+        channel_id INTEGER,
+        file_name TEXT,
+        forwarded_at TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS last_scan (
+        channel_id INTEGER PRIMARY KEY,
+        last_message_id INTEGER,
+        last_scan_time TIMESTAMP
+    )''')
     conn.commit()
     conn.close()
     logger.info("Database initialized")
 
 def is_file_forwarded(file_id: str) -> bool:
-    """Check if file has been forwarded before"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT id FROM forwarded_files WHERE file_id = ?", (file_id,))
@@ -89,7 +82,6 @@ def is_file_forwarded(file_id: str) -> bool:
     return result is not None
 
 def mark_file_forwarded(file_id: str, message_id: int, channel_id: int, file_name: str):
-    """Mark file as forwarded"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -100,18 +92,16 @@ def mark_file_forwarded(file_id: str, message_id: int, channel_id: int, file_nam
     conn.close()
 
 def update_last_scan(channel_id: int, last_message_id: int):
-    """Update last scanned message ID for channel"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "INSERT OR REPLACE INTO last_scan (id, channel_id, last_message_id, last_scan_time) VALUES ((SELECT id FROM last_scan WHERE channel_id = ?), ?, ?, ?)",
-        (channel_id, channel_id, last_message_id, datetime.now().isoformat())
+        "INSERT OR REPLACE INTO last_scan (channel_id, last_message_id, last_scan_time) VALUES (?, ?, ?)",
+        (channel_id, last_message_id, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
 
 def get_last_scan(channel_id: int) -> Optional[int]:
-    """Get last scanned message ID for channel"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT last_message_id FROM last_scan WHERE channel_id = ?", (channel_id,))
@@ -120,35 +110,49 @@ def get_last_scan(channel_id: int) -> Optional[int]:
     return result[0] if result else None
 
 # ============================================================
-# CONFIGURATION MANAGEMENT
+# CONFIGURATION
 # ============================================================
 
 def load_config() -> dict:
-    """Load configuration from JSON file"""
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             return json.load(f)
     return {
         "channels": [],
+        "api_id": None,
+        "api_hash": None,
+        "logged_in": False,
         "settings": {
-            "auto_forward": True,
             "forward_to_saved": True,
-            "forward_to_bot": True,
-            "only_txt": True,
-            "min_file_size": 0,
-            "max_file_size": 10485760  # 10MB default
+            "forward_to_bot": True
         }
     }
 
 def save_config(config: dict):
-    """Save configuration to JSON file"""
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
 
-def add_channel(channel_id: int, channel_name: str, enabled: bool = True):
-    """Add channel to watch list"""
+def save_credentials(api_id: str, api_hash: str):
     config = load_config()
-    # Check if already exists
+    config["api_id"] = api_id
+    config["api_hash"] = api_hash
+    save_config(config)
+
+def get_credentials():
+    config = load_config()
+    return config.get("api_id"), config.get("api_hash")
+
+def set_logged_in(status: bool):
+    config = load_config()
+    config["logged_in"] = status
+    save_config(config)
+
+def is_logged_in() -> bool:
+    config = load_config()
+    return config.get("logged_in", False)
+
+def add_channel(channel_id: int, channel_name: str, enabled: bool = True):
+    config = load_config()
     for ch in config["channels"]:
         if ch["id"] == channel_id:
             return False
@@ -162,13 +166,11 @@ def add_channel(channel_id: int, channel_name: str, enabled: bool = True):
     return True
 
 def remove_channel(channel_id: int):
-    """Remove channel from watch list"""
     config = load_config()
     config["channels"] = [ch for ch in config["channels"] if ch["id"] != channel_id]
     save_config(config)
 
 def toggle_channel(channel_id: int, enabled: bool):
-    """Enable/disable channel monitoring"""
     config = load_config()
     for ch in config["channels"]:
         if ch["id"] == channel_id:
@@ -177,481 +179,662 @@ def toggle_channel(channel_id: int, enabled: bool):
     save_config(config)
 
 def get_enabled_channels() -> List[dict]:
-    """Get list of enabled channels"""
     config = load_config()
     return [ch for ch in config["channels"] if ch.get("enabled", True)]
 
+def clear_channels():
+    config = load_config()
+    config["channels"] = []
+    save_config(config)
+
 # ============================================================
-# FORWARDING ENGINE
+# TELEGRAM CLIENT (in separate thread)
 # ============================================================
 
-async def forward_to_saved_messages(client: TelegramClient, message: Message, file_path: str):
-    """Forward file to Saved Messages"""
+telethon_client = None
+scanner_running = False
+client_lock = threading.Lock()
+
+async def start_telethon_client():
+    global telethon_client
+    api_id, api_hash = get_credentials()
+    if not api_id or not api_hash:
+        logger.error("No API credentials found")
+        return False
+    
+    telethon_client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
     try:
-        await client.send_file('me', file_path, caption=f"Forwarded from: {message.chat.title}\nOriginal message: {message.id}")
-        logger.info(f"Forwarded to Saved Messages: {message.file.name if message.file else 'file'}")
+        await telethon_client.start()
+        if not await telethon_client.is_user_authorized():
+            logger.error("Not authorized")
+            return False
+        me = await telethon_client.get_me()
+        logger.info(f"Telethon client started as: {me.first_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to start Telethon client: {e}")
+        return False
+
+async def forward_to_saved_messages(file_path: str, caption: str):
+    """Forward to Saved Messages using Telethon"""
+    if not telethon_client:
+        return False
+    try:
+        await telethon_client.send_file('me', file_path, caption=caption)
         return True
     except Exception as e:
         logger.error(f"Failed to forward to Saved Messages: {e}")
         return False
 
 async def forward_to_target_bot(file_path: str, file_name: str, source_chat: str):
-    """Forward file to target bot using bot token"""
-    from telethon import TelegramClient as BotClient
-    
-    bot_client = BotClient('target_bot', api_id=0, api_hash='')  # Bot client uses token only
+    """Forward using target bot (via requests)"""
     try:
-        await bot_client.start(bot_token=TARGET_BOT_TOKEN)
-        await bot_client.send_file(
-            int(TARGET_CHAT_ID),
-            file_path,
-            caption=f"📁 {file_name}\n📡 Source: {source_chat}\n⏰ Forwarded: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        logger.info(f"Forwarded to target bot: {file_name}")
-        await bot_client.disconnect()
-        return True
+        import requests
+        url = f"https://api.telegram.org/bot{TARGET_BOT_TOKEN}/sendDocument"
+        with open(file_path, 'rb') as f:
+            files = {'document': (file_name, f)}
+            data = {
+                'chat_id': TARGET_CHAT_ID,
+                'caption': f"📁 {file_name}\n📡 Source: {source_chat}\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            }
+            response = requests.post(url, data=data, files=files, timeout=30)
+            return response.status_code == 200
     except Exception as e:
         logger.error(f"Failed to forward to target bot: {e}")
         return False
+
+async def scan_and_forward():
+    """Main scanning logic - runs every 5 minutes"""
+    global scanner_running
+    
+    if scanner_running:
+        return
+    scanner_running = True
+    
+    try:
+        enabled_channels = get_enabled_channels()
+        if not enabled_channels or not telethon_client:
+            return
+        
+        for channel_info in enabled_channels:
+            try:
+                channel_id = channel_info["id"]
+                channel_name = channel_info["name"]
+                
+                # Get channel entity
+                channel = await telethon_client.get_entity(channel_id)
+                
+                # Get last scanned message ID
+                last_msg_id = get_last_scan(channel_id)
+                
+                # Get messages
+                messages = await telethon_client.get_messages(channel, limit=50)
+                
+                # Process new messages
+                new_files = []
+                for msg in messages:
+                    if last_msg_id is None or msg.id > last_msg_id:
+                        if msg.document:
+                            file_name = None
+                            if msg.document.attributes:
+                                for attr in msg.document.attributes:
+                                    if isinstance(attr, DocumentAttributeFilename):
+                                        file_name = attr.file_name
+                                        break
+                            if file_name and file_name.endswith('.txt'):
+                                new_files.append(msg)
+                
+                # Update last scan
+                if messages:
+                    latest_id = max([m.id for m in messages])
+                    update_last_scan(channel_id, latest_id)
+                
+                # Process files (oldest first)
+                for msg in reversed(new_files):
+                    file_id = str(msg.document.id)
+                    
+                    if is_file_forwarded(file_id):
+                        continue
+                    
+                    file_name = None
+                    for attr in msg.document.attributes:
+                        if isinstance(attr, DocumentAttributeFilename):
+                            file_name = attr.file_name
+                            break
+                    
+                    logger.info(f"New .txt file: {file_name} from {channel_name}")
+                    
+                    # Download file
+                    file_path = os.path.join(FILES_DIR, f"temp_{msg.id}_{file_name}")
+                    await telethon_client.download_file(msg.media, file_path)
+                    
+                    # Forward to Saved Messages
+                    config = load_config()
+                    if config["settings"].get("forward_to_saved", True):
+                        caption = f"Forwarded from: {channel_name}\nOriginal message: {msg.id}"
+                        await forward_to_saved_messages(file_path, caption)
+                    
+                    # Forward to target bot
+                    if config["settings"].get("forward_to_bot", True):
+                        await forward_to_target_bot(file_path, file_name, channel_name)
+                    
+                    # Mark as forwarded
+                    mark_file_forwarded(file_id, msg.id, channel_id, file_name)
+                    
+                    # Cleanup
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                    
+            except Exception as e:
+                logger.error(f"Error scanning channel {channel_info.get('name')}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Scan error: {e}")
     finally:
-        await bot_client.disconnect()
+        scanner_running = False
 
-async def process_new_file(client: TelegramClient, message: Message):
-    """Process and forward new .txt file"""
-    try:
-        # Check if it's a document
-        if not message.document:
-            return
-        
-        # Check if it's a .txt file
-        file_name = None
-        if message.document.attributes:
-            for attr in message.document.attributes:
-                if isinstance(attr, DocumentAttributeFilename):
-                    file_name = attr.file_name
-                    break
-        
-        if not file_name or not file_name.endswith('.txt'):
-            return
-        
-        # Get unique file ID
-        file_id = str(message.document.id)
-        
-        # Check if already forwarded
-        if is_file_forwarded(file_id):
-            logger.info(f"Skipping already forwarded file: {file_name}")
-            return
-        
-        logger.info(f"New .txt file detected: {file_name} from {message.chat.title}")
-        
-        # Download file
-        file_path = f"/tmp/{file_name}"
-        await client.download_file(message.media, file_path)
-        
-        # Forward to Saved Messages
-        config = load_config()
-        if config["settings"].get("forward_to_saved", True):
-            await forward_to_saved_messages(client, message, file_path)
-        
-        # Forward to target bot
-        if config["settings"].get("forward_to_bot", True):
-            await forward_to_target_bot(file_path, file_name, message.chat.title)
-        
-        # Mark as forwarded
-        mark_file_forwarded(file_id, message.id, message.chat.id, file_name)
-        
-        # Clean up temp file
-        try:
-            os.remove(file_path)
-        except:
-            pass
-        
-        logger.info(f"Successfully processed: {file_name}")
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {e}")
-        traceback.print_exc()
-
-async def scan_channel(client: TelegramClient, channel_info: dict):
-    """Scan a channel for new .txt files"""
-    channel_id = channel_info["id"]
-    channel_name = channel_info["name"]
-    
-    try:
-        # Get the channel entity
-        channel = await client.get_entity(channel_id)
-        
-        # Get last scanned message ID
-        last_msg_id = get_last_scan(channel_id)
-        
-        # Get messages
-        messages = await client.get_messages(channel, limit=50)
-        
-        # Process in reverse order (oldest first)
-        new_messages = []
-        for msg in messages:
-            if last_msg_id is None or msg.id > last_msg_id:
-                new_messages.append(msg)
-        
-        # Update last scan ID
-        if messages:
-            latest_id = max([m.id for m in messages])
-            update_last_scan(channel_id, latest_id)
-        
-        # Process new messages (from oldest to newest)
-        for msg in reversed(new_messages):
-            await process_new_file(client, msg)
-            
-    except Exception as e:
-        logger.error(f"Error scanning channel {channel_name}: {e}")
-
-async def continuous_scanner(client: TelegramClient):
-    """Continuous scanner that runs every 5 minutes"""
-    logger.info("Starting continuous scanner...")
-    
+async def scanner_loop():
+    """Background loop that runs scan every SCAN_INTERVAL seconds"""
     while True:
-        try:
-            config = load_config()
-            enabled_channels = get_enabled_channels()
-            
-            if not enabled_channels:
-                logger.info("No enabled channels to scan")
-            else:
-                logger.info(f"Scanning {len(enabled_channels)} channels...")
-                
-                for channel_info in enabled_channels:
-                    await scan_channel(client, channel_info)
-                
-                logger.info("Scan cycle completed")
-            
-            # Wait for next scan
-            await asyncio.sleep(SCAN_INTERVAL)
-            
-        except Exception as e:
-            logger.error(f"Scanner error: {e}")
-            await asyncio.sleep(60)
+        await scan_and_forward()
+        await asyncio.sleep(SCAN_INTERVAL)
 
 # ============================================================
-# TELEGRAM BOT COMMANDS (Using python-telegram-bot)
+# TELEGRAM BOT COMMANDS
 # ============================================================
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-
-command_app = None
-user_client = None
-
-async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    msg = (
-        "🤖 **Telegram TXT File Forwarder**\n\n"
-        "This bot monitors channels and forwards .txt files to Saved Messages and target bot.\n\n"
-        "**Commands:**\n"
-        "/start - Show this message\n"
-        "/channels - List and manage channels\n"
-        "/add - Add current channel (reply to any message in target channel)\n"
-        "/settings - Configure forwarding settings\n"
-        "/status - Show current status\n"
-        "/scan - Manually trigger scan\n\n"
-        "⚠️ **Setup Required:**\n"
-        "First, log in with your Telegram account using the login command."
-    )
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def bot_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List and manage channels"""
-    config = load_config()
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
-    if not config["channels"]:
-        msg = "📭 No channels added.\n\nTo add a channel:\n1. Go to the channel\n2. Reply to any message with /add"
-        await update.message.reply_text(msg)
+    if is_logged_in():
+        await show_main_menu(update)
+    else:
+        msg = (
+            "🤖 **Telegram TXT File Forwarder**\n\n"
+            "This bot monitors channels and forwards .txt files.\n\n"
+            "**First, you need to log in with your Telegram account:**\n\n"
+            "1. Get your API credentials from https://my.telegram.org/apps\n"
+            "2. Send `/login [api_id] [api_hash]`\n\n"
+            "Example: `/login 1234567 abcdef1234567890`\n\n"
+            "⚠️ Your credentials are stored locally and never shared."
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    
+    if len(args) != 2:
+        await update.message.reply_text(
+            "❌ **Usage:** `/login [api_id] [api_hash]`\n\n"
+            "Get your credentials from: https://my.telegram.org/apps",
+            parse_mode='Markdown'
+        )
         return
     
+    api_id, api_hash = args[0], args[1]
+    
+    await update.message.reply_text("🔄 **Logging in...**\n\nPlease enter your phone number (with country code) in the next message.")
+    
+    # Store credentials temporarily
+    context.user_data['pending_login'] = (api_id, api_hash)
+    context.user_data['login_step'] = 'phone'
+
+async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle multi-step login input"""
+    if 'pending_login' not in context.user_data:
+        return
+    
+    step = context.user_data.get('login_step')
+    api_id, api_hash = context.user_data['pending_login']
+    
+    if step == 'phone':
+        phone = update.message.text.strip()
+        context.user_data['login_phone'] = phone
+        context.user_data['login_step'] = 'code'
+        
+        # Request code via Telethon (in background)
+        async def request_code():
+            client = TelegramClient(None, int(api_id), api_hash)
+            await client.connect()
+            await client.send_code_request(phone)
+            await client.disconnect()
+        
+        asyncio.create_task(request_code())
+        
+        await update.message.reply_text(
+            "✅ **Code sent!**\n\n"
+            "Please enter the OTP code you received:"
+        )
+        
+    elif step == 'code':
+        code = update.message.text.strip()
+        phone = context.user_data['login_phone']
+        
+        await update.message.reply_text("🔄 **Verifying code...**")
+        
+        # Attempt login
+        client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
+        
+        try:
+            await client.connect()
+            await client.sign_in(phone, code)
+            
+            # Check if 2FA needed
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                save_credentials(api_id, api_hash)
+                set_logged_in(True)
+                
+                await update.message.reply_text(
+                    f"✅ **Login successful!**\n\n"
+                    f"Welcome, {me.first_name}! (@{me.username or 'no username'})\n\n"
+                    f"Now fetching your channels..."
+                )
+                
+                # Fetch all channels
+                await fetch_and_show_channels(update, client)
+                
+                # Start background scanner
+                global telethon_client
+                telethon_client = client
+                asyncio.create_task(scanner_loop())
+                
+            else:
+                context.user_data['login_step'] = 'password'
+                await update.message.reply_text("🔐 **2FA Enabled**\n\nPlease enter your password:")
+                
+        except SessionPasswordNeededError:
+            context.user_data['login_step'] = 'password'
+            await update.message.reply_text("🔐 **2FA Enabled**\n\nPlease enter your password:")
+        except Exception as e:
+            await update.message.reply_text(f"❌ **Login failed:** `{str(e)}`", parse_mode='Markdown')
+            context.user_data.pop('pending_login', None)
+            context.user_data.pop('login_step', None)
+            context.user_data.pop('login_phone', None)
+            await client.disconnect()
+            
+    elif step == 'password':
+        password = update.message.text.strip()
+        phone = context.user_data['login_phone']
+        api_id, api_hash = context.user_data['pending_login']
+        
+        client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
+        
+        try:
+            await client.connect()
+            await client.sign_in(password=password)
+            
+            me = await client.get_me()
+            save_credentials(api_id, api_hash)
+            set_logged_in(True)
+            
+            await update.message.reply_text(
+                f"✅ **Login successful!**\n\n"
+                f"Welcome, {me.first_name}! (@{me.username or 'no username'})\n\n"
+                f"Now fetching your channels..."
+            )
+            
+            await fetch_and_show_channels(update, client)
+            
+            global telethon_client
+            telethon_client = client
+            asyncio.create_task(scanner_loop())
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ **Login failed:** `{str(e)}`", parse_mode='Markdown')
+        finally:
+            context.user_data.pop('pending_login', None)
+            context.user_data.pop('login_step', None)
+            context.user_data.pop('login_phone', None)
+
+async def fetch_and_show_channels(update: Update, client):
+    """Fetch all channels and show selection UI"""
+    try:
+        dialogs = await client.get_dialogs()
+        channels = []
+        
+        for dialog in dialogs:
+            if dialog.is_channel:
+                channels.append({
+                    'id': dialog.id,
+                    'name': dialog.name,
+                    'username': dialog.entity.username,
+                    'participants_count': getattr(dialog.entity, 'participants_count', 0)
+                })
+        
+        # Save to config
+        clear_channels()
+        for ch in channels:
+            add_channel(ch['id'], ch['name'], enabled=True)
+        
+        # Show selection UI
+        await show_channel_selection(update, channels)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch channels: {str(e)}")
+
+async def show_channel_selection(update: Update, channels: List[dict]):
+    """Show interactive channel selection menu"""
+    if not channels:
+        await update.message.reply_text("📭 No channels found. Make sure you're a member of some channels.")
+        return
+    
+    config = load_config()
+    enabled_ids = {ch["id"] for ch in config["channels"] if ch.get("enabled", True)}
+    
     keyboard = []
-    for ch in config["channels"]:
-        status = "✅ Active" if ch.get("enabled", True) else "⏸️ Disabled"
+    for ch in channels:
+        status = "✅" if ch['id'] in enabled_ids else "⏸️"
         keyboard.append([
             InlineKeyboardButton(
-                f"{ch['name'][:30]} - {status}",
-                callback_data=f"channel_{ch['id']}"
+                f"{status} {ch['name'][:35]}",
+                callback_data=f"sel_{ch['id']}"
             )
         ])
     
+    keyboard.append([InlineKeyboardButton("✅ Confirm Selection", callback_data="confirm_channels")])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_channels")])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📋 **Your Channels:**\n\nTap a channel to manage it.", reply_markup=reply_markup, parse_mode='Markdown')
+    
+    await update.message.reply_text(
+        f"📋 **Select Channels to Monitor**\n\n"
+        f"Found {len(channels)} channels.\n"
+        f"Tap to toggle monitoring on/off.\n\n"
+        f"✅ = Active | ⏸️ = Disabled",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-async def bot_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add current channel (reply to message in channel)"""
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Please reply to any message in the channel you want to add.")
-        return
-    
-    chat = update.message.reply_to_message.chat
-    if chat.type not in ['channel', 'supergroup']:
-        await update.message.reply_text("❌ This is not a channel.")
-        return
-    
-    channel_id = chat.id
-    channel_name = chat.title
-    
-    if add_channel(channel_id, channel_name):
-        await update.message.reply_text(f"✅ Added channel: {channel_name}\n\nUse /channels to manage it.")
-    else:
-        await update.message.reply_text(f"⚠️ Channel already in list: {channel_name}")
-
-async def bot_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Configure forwarding settings"""
+async def show_main_menu(update: Update):
+    """Show main menu after login"""
     config = load_config()
-    settings = config.get("settings", {})
+    enabled_count = len(get_enabled_channels())
+    total_count = len(config["channels"])
     
     msg = (
-        "⚙️ **Forwarding Settings**\n\n"
-        f"📤 Forward to Saved Messages: {'✅ ON' if settings.get('forward_to_saved', True) else '❌ OFF'}\n"
-        f"🤖 Forward to Target Bot: {'✅ ON' if settings.get('forward_to_bot', True) else '❌ OFF'}\n"
-        f"📄 Only .txt files: {'✅ ON' if settings.get('only_txt', True) else '❌ OFF'}\n\n"
-        "Use buttons below to toggle settings:"
+        f"✅ **Logged In**\n\n"
+        f"📡 **Channels:** {enabled_count}/{total_count} active\n"
+        f"📁 **Scan Interval:** {SCAN_INTERVAL // 60} minutes\n"
+        f"📤 **Forward to Saved:** {'ON' if config['settings'].get('forward_to_saved', True) else 'OFF'}\n"
+        f"🤖 **Forward to Bot:** {'ON' if config['settings'].get('forward_to_bot', True) else 'OFF'}\n\n"
+        f"**Commands:**\n"
+        f"/channels - Manage channels\n"
+        f"/settings - Change forwarding settings\n"
+        f"/status - View statistics\n"
+        f"/scan - Manual scan\n"
+        f"/logout - Log out"
     )
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show channel management menu"""
+    if not is_logged_in():
+        await update.message.reply_text("❌ Please login first using /login")
+        return
+    
+    config = load_config()
+    channels = config["channels"]
+    enabled_ids = {ch["id"] for ch in channels if ch.get("enabled", True)}
+    
+    if not channels:
+        await update.message.reply_text("📭 No channels configured. Run /refresh to fetch your channels.")
+        return
+    
+    keyboard = []
+    for ch in channels:
+        status = "✅" if ch['id'] in enabled_ids else "⏸️"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {ch['name'][:35]}",
+                callback_data=f"toggle_{ch['id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔄 Refresh Channel List", callback_data="refresh_channels")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📋 **Your Channels**\n\nTap to toggle monitoring on/off:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show settings menu"""
+    if not is_logged_in():
+        await update.message.reply_text("❌ Please login first using /login")
+        return
+    
+    config = load_config()
+    settings = config["settings"]
     
     keyboard = [
         [
-            InlineKeyboardButton("Toggle Saved Messages", callback_data="toggle_saved"),
-            InlineKeyboardButton("Toggle Bot Forward", callback_data="toggle_bot")
+            InlineKeyboardButton(
+                f"📤 Saved: {'ON' if settings.get('forward_to_saved', True) else 'OFF'}",
+                callback_data="toggle_saved"
+            )
         ],
-        [InlineKeyboardButton("Toggle .txt Only", callback_data="toggle_txt")],
+        [
+            InlineKeyboardButton(
+                f"🤖 Bot: {'ON' if settings.get('forward_to_bot', True) else 'OFF'}",
+                callback_data="toggle_bot"
+            )
+        ],
+        [InlineKeyboardButton("🔄 Manual Scan", callback_data="manual_scan")],
         [InlineKeyboardButton("Close", callback_data="close")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current status"""
-    config = load_config()
-    enabled_channels = get_enabled_channels()
     
-    # Count forwarded files
+    await update.message.reply_text(
+        "⚙️ **Settings**\n\nSelect an option to toggle:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show status statistics"""
+    if not is_logged_in():
+        await update.message.reply_text("❌ Please login first using /login")
+        return
+    
+    config = load_config()
+    enabled_count = len(get_enabled_channels())
+    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM forwarded_files")
-    total_forwarded = c.fetchone()[0]
+    total = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM forwarded_files WHERE forwarded_at > datetime('now', '-24 hours')")
-    today_forwarded = c.fetchone()[0]
+    today = c.fetchone()[0]
     conn.close()
     
     msg = (
-        "📊 **System Status**\n\n"
-        f"📡 **Channels:** {len(config['channels'])} total, {len(enabled_channels)} active\n"
-        f"📁 **Files Forwarded:** {total_forwarded} total, {today_forwarded} today\n"
+        f"📊 **Status**\n\n"
+        f"📡 **Active Channels:** {enabled_count}\n"
+        f"📁 **Files Forwarded:** {total} total, {today} today\n"
         f"⏱️ **Scan Interval:** {SCAN_INTERVAL // 60} minutes\n"
-        f"🎯 **Target Bot:** {'Connected' if TARGET_BOT_TOKEN else 'Not set'}\n\n"
-        "✅ System is running normally."
+        f"🤖 **Scanner:** {'Running' if telethon_client else 'Not started'}\n\n"
+        f"Use /scan to trigger manual scan."
     )
+    
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-async def bot_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manually trigger scan"""
-    await update.message.reply_text("🔄 Manual scan triggered...")
-    # Trigger scan in background
-    asyncio.create_task(manual_scan())
-
-async def manual_scan():
-    """Manual scan function"""
-    global user_client
-    if user_client and user_client.is_connected():
-        config = load_config()
-        enabled_channels = get_enabled_channels()
-        for channel_info in enabled_channels:
-            await scan_channel(user_client, channel_info)
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log out and clear session"""
+    global telethon_client
+    
+    if telethon_client:
+        await telethon_client.disconnect()
+        telethon_client = None
+    
+    # Remove session file
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+    
+    set_logged_in(False)
+    clear_channels()
+    
+    await update.message.reply_text(
+        "✅ **Logged out**\n\nYour session has been cleared.\nUse /login to log in again."
+    )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard callbacks"""
+    """Handle inline button clicks"""
     query = update.callback_query
     await query.answer()
-    
     data = query.data
     
-    if data.startswith("channel_"):
-        channel_id = int(data.split("_")[1])
-        config = load_config()
-        channel = None
-        for ch in config["channels"]:
-            if ch["id"] == channel_id:
-                channel = ch
-                break
-        
-        if channel:
-            status = "✅ Active" if channel.get("enabled", True) else "⏸️ Disabled"
-            keyboard = [
-                [InlineKeyboardButton("✅ Enable" if not channel.get("enabled", True) else "⏸️ Disable", callback_data=f"toggle_{channel_id}")],
-                [InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{channel_id}")],
-                [InlineKeyboardButton("◀️ Back", callback_data="back_to_channels")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                f"📌 **{channel['name']}**\n\nStatus: {status}\nAdded: {channel.get('added_at', 'Unknown')}",
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-    
-    elif data.startswith("toggle_"):
+    if data.startswith("toggle_"):
         channel_id = int(data.split("_")[1])
         config = load_config()
         for ch in config["channels"]:
             if ch["id"] == channel_id:
-                ch["enabled"] = not ch.get("enabled", True)
-                save_config(config)
+                current = ch.get("enabled", True)
+                ch["enabled"] = not current
                 break
+        save_config(config)
         
-        # Go back to channel list
-        await bot_channels(update, context)
-    
-    elif data.startswith("remove_"):
+        # Refresh channel list
+        await channels_command(update, context)
+        
+    elif data.startswith("sel_"):
         channel_id = int(data.split("_")[1])
-        remove_channel(channel_id)
-        await bot_channels(update, context)
-    
-    elif data == "back_to_channels":
-        await bot_channels(update, context)
-    
+        config = load_config()
+        for ch in config["channels"]:
+            if ch["id"] == channel_id:
+                current = ch.get("enabled", True)
+                ch["enabled"] = not current
+                break
+        save_config(config)
+        
+        # Refresh selection menu
+        await refresh_selection_menu(update, query.message)
+        
+    elif data == "confirm_channels":
+        await query.edit_message_text(
+            "✅ **Channels saved!**\n\nMonitoring will now begin.\n\nUse /status to check progress."
+        )
+        
+    elif data == "refresh_channels":
+        await query.edit_message_text("🔄 Refreshing channel list...")
+        if telethon_client:
+            await fetch_and_show_channels(update, telethon_client)
+        else:
+            await query.edit_message_text("❌ Not connected. Please log in again.")
+            
     elif data == "toggle_saved":
         config = load_config()
         config["settings"]["forward_to_saved"] = not config["settings"].get("forward_to_saved", True)
         save_config(config)
-        await bot_settings(update, context)
-    
+        await settings_command(update, context)
+        
     elif data == "toggle_bot":
         config = load_config()
         config["settings"]["forward_to_bot"] = not config["settings"].get("forward_to_bot", True)
         save_config(config)
-        await bot_settings(update, context)
-    
-    elif data == "toggle_txt":
-        config = load_config()
-        config["settings"]["only_txt"] = not config["settings"].get("only_txt", True)
-        save_config(config)
-        await bot_settings(update, context)
-    
+        await settings_command(update, context)
+        
+    elif data == "manual_scan":
+        await query.edit_message_text("🔄 Manual scan triggered...")
+        asyncio.create_task(scan_and_forward())
+        
     elif data == "close":
         await query.delete_message()
 
-# ============================================================
-# USER LOGIN SYSTEM (Telethon)
-# ============================================================
-
-async def login_user():
-    """Interactive login with Telegram account"""
-    global user_client
+async def refresh_selection_menu(update: Update, message):
+    """Refresh the channel selection menu"""
+    config = load_config()
+    channels = config["channels"]
+    enabled_ids = {ch["id"] for ch in channels if ch.get("enabled", True)}
     
-    print("\n" + "="*50)
-    print("🔐 TELEGRAM ACCOUNT LOGIN")
-    print("="*50)
+    keyboard = []
+    for ch in channels:
+        status = "✅" if ch['id'] in enabled_ids else "⏸️"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {ch['name'][:35]}",
+                callback_data=f"sel_{ch['id']}"
+            )
+        ])
     
-    # Get API credentials
-    print("\n⚠️ You need Telegram API credentials:")
-    print("1. Go to https://my.telegram.org/apps")
-    print("2. Create an app if you haven't")
-    print("3. Enter your api_id and api_hash below\n")
+    keyboard.append([InlineKeyboardButton("✅ Confirm Selection", callback_data="confirm_channels")])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_channels")])
     
-    api_id = input("Enter api_id: ").strip()
-    api_hash = input("Enter api_hash: ").strip()
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not api_id or not api_hash:
-        print("❌ API credentials required!")
-        return False
-    
-    # Create client
-    user_client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
-    
-    try:
-        await user_client.start()
-        
-        if not await user_client.is_user_authorized():
-            print("❌ Login failed")
-            return False
-        
-        me = await user_client.get_me()
-        print(f"\n✅ Logged in as: {me.first_name} (@{me.username})")
-        print(f"📱 Phone: {me.phone}")
-        
-        # Test connection
-        dialogs = await user_client.get_dialogs()
-        print(f"📊 Found {len(dialogs)} dialogs")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Login error: {e}")
-        return False
+    await message.edit_text(
+        f"📋 **Select Channels to Monitor**\n\n"
+        f"Found {len(channels)} channels.\n"
+        f"Tap to toggle monitoring on/off.\n\n"
+        f"✅ = Active | ⏸️ = Disabled",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
 # ============================================================
-# MAIN APPLICATION
+# MAIN
 # ============================================================
 
 async def main():
-    global command_app, user_client
+    global telethon_client
     
-    # Initialize database
     init_db()
     
-    # Login to Telegram account
-    print("\n🔐 Telegram Account Login Required")
-    print("This bot needs your Telegram account to monitor channels.")
-    print("Your session will be saved, so you only need to log in once.\n")
-    
-    if os.path.exists(SESSION_FILE):
-        print("✅ Existing session found!")
-        response = input("Use existing session? (y/n): ").strip().lower()
-        if response != 'y':
-            os.remove(SESSION_FILE)
-            print("Session removed. Starting fresh login...")
-    
-    # Login
-    login_success = await login_user()
-    if not login_success:
-        print("❌ Login failed. Exiting...")
-        return
-    
-    # Start scanner in background
-    asyncio.create_task(continuous_scanner(user_client))
+    # Try to load existing session
+    api_id, api_hash = get_credentials()
+    if api_id and api_hash and os.path.exists(SESSION_FILE):
+        telethon_client = TelegramClient(SESSION_FILE, int(api_id), api_hash)
+        try:
+            await telethon_client.start()
+            if await telethon_client.is_user_authorized():
+                set_logged_in(True)
+                me = await telethon_client.get_me()
+                logger.info(f"Loaded existing session for: {me.first_name}")
+                asyncio.create_task(scanner_loop())
+            else:
+                set_logged_in(False)
+        except Exception as e:
+            logger.error(f"Failed to load session: {e}")
+            set_logged_in(False)
     
     # Start command bot
-    command_app = Application.builder().token(COMMAND_BOT_TOKEN).build()
+    app = Application.builder().token(COMMAND_BOT_TOKEN).build()
     
-    command_app.add_handler(CommandHandler("start", bot_start))
-    command_app.add_handler(CommandHandler("channels", bot_channels))
-    command_app.add_handler(CommandHandler("add", bot_add))
-    command_app.add_handler(CommandHandler("settings", bot_settings))
-    command_app.add_handler(CommandHandler("status", bot_status))
-    command_app.add_handler(CommandHandler("scan", bot_scan))
-    command_app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("logout", logout_command))
+    app.add_handler(CommandHandler("scan", lambda u,c: asyncio.create_task(scan_and_forward())))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
+    app.add_handler(CallbackQueryHandler(button_callback))
     
-    print("\n" + "="*50)
-    print("🤖 TELEGRAM TXT FILE FORWARDER")
-    print("="*50)
-    print(f"✅ Account logged in")
-    print(f"📡 Command Bot: @{COMMAND_BOT_TOKEN.split(':')[0]}")
-    print(f"🎯 Target Bot ID: {TARGET_BOT_TOKEN.split(':')[0]}")
-    print(f"📁 Target Chat: {TARGET_CHAT_ID}")
-    print(f"⏱️ Scan Interval: {SCAN_INTERVAL // 60} minutes")
-    print("="*50)
-    print("Bot is running! Use /start in your command bot to manage channels.")
-    print("Press Ctrl+C to stop.\n")
+    logger.info("Bot started! Waiting for commands...")
+    logger.info(f"Command Bot: @{COMMAND_BOT_TOKEN.split(':')[0]}")
+    logger.info(f"Target Chat: {TARGET_CHAT_ID}")
+    logger.info(f"Scan Interval: {SCAN_INTERVAL // 60} minutes")
     
-    # Run both clients
-    await command_app.initialize()
-    await command_app.start()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     
     try:
-        await asyncio.gather(
-            command_app.updater.start_polling(),
-            asyncio.Event().wait()  # Keep running
-        )
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        pass
     finally:
-        await command_app.stop()
-        if user_client:
-            await user_client.disconnect()
+        await app.stop()
+        if telethon_client:
+            await telethon_client.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())
