@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram TXT File Forwarder - Direct Login Version
-Works on Railway - Login via Telegram messages
+Telegram TXT File Forwarder - Fixed Login (No Code Expiration)
 """
 
 import os
@@ -18,8 +17,10 @@ from telethon.tl.types import DocumentAttributeFilename
 from telethon.errors import (
     SessionPasswordNeededError, 
     PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
     PhoneNumberInvalidError,
-    FloodWaitError
+    FloodWaitError,
+    RPCError
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -174,13 +175,15 @@ class ForwarderBot:
         self.temp_client = None
         self.login_phone = None
         self.login_hash = None
+        self.login_client = None
 
     async def start_login(self, phone: str):
-        """Start login process - send code"""
+        """Start login process - send code with persistent client"""
         try:
-            self.temp_client = TelegramClient(None, API_ID, API_HASH)
-            await self.temp_client.connect()
-            result = await self.temp_client.send_code_request(phone)
+            # Create persistent client that stays connected
+            self.login_client = TelegramClient(None, API_ID, API_HASH)
+            await self.login_client.connect()
+            result = await self.login_client.send_code_request(phone)
             self.login_phone = phone
             self.login_hash = result.phone_code_hash
             return {"status": "code_sent"}
@@ -188,43 +191,61 @@ class ForwarderBot:
             return {"status": "error", "message": "Invalid phone number"}
         except FloodWaitError as e:
             return {"status": "error", "message": f"Wait {e.seconds} seconds"}
+        except RPCError as e:
+            return {"status": "error", "message": f"Telegram error: {str(e)}"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
     async def verify_code(self, code: str):
-        """Verify OTP code"""
+        """Verify OTP code with persistent client"""
         try:
-            await self.temp_client.sign_in(self.login_phone, code, phone_code_hash=self.login_hash)
-            if await self.temp_client.is_user_authorized():
+            await self.login_client.sign_in(self.login_phone, code, phone_code_hash=self.login_hash)
+            
+            if await self.login_client.is_user_authorized():
                 # Save session permanently
-                await self.temp_client.disconnect()
+                me = await self.login_client.get_me()
+                # Disconnect temp client
+                await self.login_client.disconnect()
+                # Create permanent client with saved session
                 self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
                 await self.client.start()
-                me = await self.client.get_me()
                 set_logged_in(True)
                 return {"status": "success", "user": me.first_name}
+                
         except SessionPasswordNeededError:
             return {"status": "password_needed"}
+        except PhoneCodeExpiredError:
+            return {"status": "code_expired"}
         except PhoneCodeInvalidError:
-            return {"status": "error", "message": "Invalid code"}
+            return {"status": "invalid_code"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
         return {"status": "error", "message": "Unknown error"}
 
     async def verify_password(self, password: str):
-        """Verify 2FA password"""
+        """Verify 2FA password with persistent client"""
         try:
-            await self.temp_client.sign_in(password=password)
-            if await self.temp_client.is_user_authorized():
-                await self.temp_client.disconnect()
+            await self.login_client.sign_in(password=password)
+            
+            if await self.login_client.is_user_authorized():
+                me = await self.login_client.get_me()
+                await self.login_client.disconnect()
                 self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
                 await self.client.start()
-                me = await self.client.get_me()
                 set_logged_in(True)
                 return {"status": "success", "user": me.first_name}
         except Exception as e:
             return {"status": "error", "message": str(e)}
         return {"status": "error", "message": "Unknown error"}
+
+    async def resend_code(self):
+        """Resend verification code"""
+        try:
+            result = await self.login_client.send_code_request(self.login_phone)
+            self.login_hash = result.phone_code_hash
+            return {"status": "code_sent"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     async def start_scanner(self):
         if self.scanner_task:
@@ -325,6 +346,8 @@ class ForwarderBot:
             self.scanner_task.cancel()
         if self.client:
             await self.client.disconnect()
+        if self.login_client:
+            await self.login_client.disconnect()
 
 # ============================================================
 # TELEGRAM COMMANDS
@@ -339,12 +362,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = (
             "🤖 **Telegram TXT File Forwarder**\n\n"
-            "**Login to your Telegram account:**\n\n"
-            "1. Send your phone number with country code\n"
-            "   Example: `/login +977XXXXXXXXX`\n\n"
-            "2. Enter the OTP code you receive\n\n"
-            "3. If you have 2FA, enter your password\n\n"
-            "After login, you can select channels to monitor."
+            "**Login:**\n\n"
+            "1. Send: `/login +977XXXXXXXXX`\n"
+            "2. Enter the OTP code\n"
+            "3. If 2FA, enter password\n\n"
+            "**If code expires:**\n"
+            "Type `/resend` for a new code"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -370,13 +393,28 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await forwarder.start_login(phone)
     
     if result["status"] == "code_sent":
-        login_states[user_id] = {"step": "code"}
+        login_states[user_id] = {"step": "code", "phone": phone}
         await update.message.reply_text(
             "✅ **Code sent!**\n\n"
-            "Enter the OTP code you received in Telegram:\n"
-            "Just type the code (e.g., `12345`)",
+            "Enter the OTP code you received:\n"
+            "Type `/resend` if code expires.",
             parse_mode='Markdown'
         )
+    else:
+        await update.message.reply_text(f"❌ Error: {result.get('message', 'Unknown error')}")
+
+async def resend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resend verification code"""
+    user_id = update.effective_user.id
+    if user_id not in login_states:
+        await update.message.reply_text("❌ No active login. Use /login first.")
+        return
+    
+    await update.message.reply_text("🔄 **Requesting new code...**")
+    result = await forwarder.resend_code()
+    
+    if result["status"] == "code_sent":
+        await update.message.reply_text("✅ **New code sent!**\n\nEnter the OTP code:", parse_mode='Markdown')
     else:
         await update.message.reply_text(f"❌ Error: {result.get('message', 'Unknown error')}")
 
@@ -384,8 +422,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    # Check if user is in login flow
-    if user_id in login_states:
+    # Only handle numeric input (OTP codes) during login
+    if user_id in login_states and text.isdigit():
         state = login_states[user_id]
         
         if state["step"] == "code":
@@ -417,8 +455,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Enter your Telegram password:",
                     parse_mode='Markdown'
                 )
+            elif result["status"] == "code_expired":
+                await update.message.reply_text(
+                    "❌ **Code expired**\n\n"
+                    "Type `/resend` to get a new code.",
+                    parse_mode='Markdown'
+                )
+            elif result["status"] == "invalid_code":
+                await update.message.reply_text(
+                    "❌ **Invalid code**\n\n"
+                    "Try again, or type `/resend` for a new code.",
+                    parse_mode='Markdown'
+                )
             else:
-                await update.message.reply_text(f"❌ {result.get('message', 'Invalid code. Try again.')}")
+                await update.message.reply_text(f"❌ {result.get('message', 'Unknown error')}")
         
         elif state["step"] == "password":
             await update.message.reply_text("🔄 **Verifying password...**")
@@ -443,8 +493,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 login_states.pop(user_id, None)
             else:
                 await update.message.reply_text(f"❌ {result.get('message', 'Wrong password')}")
-    
-    # If not in login flow, ignore (or could add other commands)
 
 async def show_channel_selector(update: Update, channels: List[dict]):
     keyboard = []
@@ -556,6 +604,7 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_logged_in(False)
     clear_channels()
     forwarder = None
+    login_states.clear()
     await update.message.reply_text("✅ **Logged out**\n\nUse /login +977XXXXXXXXX to log in again.", parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,6 +682,7 @@ async def main():
     app = Application.builder().token(COMMAND_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("login", login_cmd))
+    app.add_handler(CommandHandler("resend", resend_cmd))
     app.add_handler(CommandHandler("channels", channels_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
