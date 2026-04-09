@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TELEGRAM TXT FILE FORWARDER - WORKING LOGIN
-With residential proxy support to bypass Telegram cloud blocks
+Phone number + OTP login - works on Railway with proper persistence
 """
 
 import os
@@ -20,8 +20,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PhoneNumberInvalidError,
-    FloodWaitError,
-    RPCError
+    FloodWaitError
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -35,18 +34,6 @@ TARGET_BOT_TOKEN = "8657130802:AAE8Ynf791ramxyFktFPHgwuv0b5vNKiKH0"
 TARGET_CHAT_ID = "8260250818"
 API_ID = 39184727
 API_HASH = "a52c4985a38ef98c84cdf11d45e53baf"
-
-# ============================================================
-# PROXY CONFIGURATION (OPTIONAL - UNCOMMENT TO USE)
-# Get free proxies from: https://free-proxy-list.net/
-# ============================================================
-# PROXY = {
-#     'proxy_type': 'socks5',  # or 'http'
-#     'addr': '192.252.215.5',  # proxy IP
-#     'port': 4145,             # proxy port
-#     'rdns': True
-# }
-PROXY = None  # Set to None for no proxy
 
 DATA_DIR = "/app/data" if os.path.exists("/app") else "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -165,73 +152,60 @@ def clear_channels():
     save_channels([])
 
 # ============================================================
-# FORWARDER ENGINE
+# TELEGRAM CLIENT MANAGER
 # ============================================================
 
-class TelegramForwarder:
+class TelegramClientManager:
     def __init__(self):
         self.client = None
         self.scanner_task = None
         self.running = True
-        self.login_data = {}  # Store login state per user
+        self.login_sessions = {}
 
-    async def load_existing_session(self) -> bool:
-        """Load existing session - NO LOGIN ATTEMPT"""
+    async def load_session(self) -> bool:
         if not os.path.exists(SESSION_FILE):
             return False
-        
         try:
-            if PROXY:
-                self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH, proxy=PROXY)
-            else:
-                self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
             await self.client.start()
             if await self.client.is_user_authorized():
                 me = await self.client.get_me()
                 logger.info(f"✅ Session loaded: {me.first_name}")
                 return True
         except Exception as e:
-            logger.error(f"Failed to load session: {e}")
+            logger.error(f"Session load failed: {e}")
         return False
 
-    async def start_login(self, user_id: int, phone: str):
-        """Step 1: Request code"""
-        self.login_data[user_id] = {"phone": phone, "step": "code"}
-        
+    async def send_code(self, phone: str, user_id: int) -> dict:
         try:
-            if PROXY:
-                client = TelegramClient(None, API_ID, API_HASH, proxy=PROXY)
-            else:
-                client = TelegramClient(None, API_ID, API_HASH)
+            client = TelegramClient(None, API_ID, API_HASH)
             await client.connect()
-            
             result = await client.send_code_request(phone)
-            self.login_data[user_id]["client"] = client
-            self.login_data[user_id]["phone_code_hash"] = result.phone_code_hash
-            
+            self.login_sessions[user_id] = {
+                "client": client,
+                "phone": phone,
+                "phone_code_hash": result.phone_code_hash,
+                "step": "code"
+            }
             return {"status": "code_sent"}
         except PhoneNumberInvalidError:
-            return {"status": "error", "message": "Invalid phone number"}
+            return {"status": "error", "message": "Invalid phone number. Use +countrycode (e.g., +977XXXXXXXXX)"}
         except FloodWaitError as e:
-            return {"status": "error", "message": f"Wait {e.seconds} seconds"}
+            return {"status": "error", "message": f"Too many attempts. Wait {e.seconds} seconds."}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    async def verify_code(self, user_id: int, code: str):
-        """Step 2: Verify code"""
-        data = self.login_data.get(user_id)
-        if not data:
-            return {"status": "error", "message": "No login session"}
+    async def verify_code(self, code: str, user_id: int) -> dict:
+        session = self.login_sessions.get(user_id)
+        if not session:
+            return {"status": "error", "message": "No active login session. Use /login again."}
         
-        client = data.get("client")
-        if not client:
-            return {"status": "error", "message": "Client not found"}
-        
+        client = session["client"]
         try:
             await client.sign_in(
-                data["phone"], 
+                session["phone"], 
                 code, 
-                phone_code_hash=data.get("phone_code_hash")
+                phone_code_hash=session["phone_code_hash"]
             )
             
             if await client.is_user_authorized():
@@ -239,60 +213,46 @@ class TelegramForwarder:
                 await client.disconnect()
                 
                 # Save session permanently
-                if PROXY:
-                    self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH, proxy=PROXY)
-                else:
-                    self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+                self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
                 await self.client.start()
                 
-                # Cleanup
-                await client.disconnect()
-                self.login_data.pop(user_id, None)
-                
+                self.login_sessions.pop(user_id, None)
                 return {"status": "success", "user": me.first_name}
                 
         except SessionPasswordNeededError:
+            session["step"] = "password"
             return {"status": "password_needed"}
         except PhoneCodeExpiredError:
-            return {"status": "error", "message": "Code expired. Use /login again"}
+            return {"status": "error", "message": "Code expired. Use /login to restart."}
         except PhoneCodeInvalidError:
-            return {"status": "error", "message": "Invalid code"}
+            return {"status": "error", "message": "Invalid code. Try again."}
         except Exception as e:
             return {"status": "error", "message": str(e)}
         
         return {"status": "error", "message": "Unknown error"}
 
-    async def verify_password(self, user_id: int, password: str):
-        """Step 3: Verify 2FA password"""
-        data = self.login_data.get(user_id)
-        if not data:
-            return {"status": "error", "message": "No login session"}
+    async def verify_password(self, password: str, user_id: int) -> dict:
+        session = self.login_sessions.get(user_id)
+        if not session:
+            return {"status": "error", "message": "No active login session"}
         
-        client = data.get("client")
-        if not client:
-            return {"status": "error", "message": "Client not found"}
-        
+        client = session["client"]
         try:
             await client.sign_in(password=password)
             
             if await client.is_user_authorized():
                 me = await client.get_me()
+                await client.disconnect()
                 
-                # Save session permanently
-                if PROXY:
-                    self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH, proxy=PROXY)
-                else:
-                    self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+                self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
                 await self.client.start()
                 
-                await client.disconnect()
-                self.login_data.pop(user_id, None)
-                
+                self.login_sessions.pop(user_id, None)
                 return {"status": "success", "user": me.first_name}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": "Wrong password"}
         
-        return {"status": "error", "message": "Wrong password"}
+        return {"status": "error", "message": "Unknown error"}
 
     async def start_scanner(self):
         if self.scanner_task:
@@ -425,11 +385,12 @@ class TelegramForwarder:
 # TELEGRAM BOT COMMANDS
 # ============================================================
 
-forwarder = None
-login_states = {}  # Track which users are logging in
+manager = None
+user_states = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if forwarder and forwarder.client and forwarder.client.is_connected():
+    global manager
+    if manager and manager.client and manager.client.is_connected():
         await show_main_menu(update)
     else:
         msg = (
@@ -438,8 +399,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/login +977XXXXXXXXX`\n\n"
             "Then enter the OTP code.\n"
             "If 2FA, enter password.\n\n"
-            "After login, select channels to monitor.\n\n"
-            "**Note:** If you get 'code expired', wait 30 seconds and try `/login` again."
+            "After login, add channels to monitor."
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -460,16 +420,16 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
-    await update.message.reply_text("🔄 **Requesting verification code...**")
+    await update.message.reply_text("🔄 **Sending verification code...**")
     
-    global forwarder
-    if not forwarder:
-        forwarder = TelegramForwarder()
+    global manager
+    if not manager:
+        manager = TelegramClientManager()
     
-    result = await forwarder.start_login(user_id, phone)
+    result = await manager.send_code(phone, user_id)
     
     if result["status"] == "code_sent":
-        login_states[user_id] = {"step": "code"}
+        user_states[user_id] = {"step": "code"}
         await update.message.reply_text(
             "✅ **Code sent!**\n\n"
             "Enter the OTP code you received in Telegram:\n"
@@ -482,13 +442,13 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in login_states:
-        login_states.pop(user_id)
+    if user_id in user_states:
+        user_states.pop(user_id)
     await update.message.reply_text("✅ Login cancelled.")
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in login_states:
+    if user_id not in user_states:
         return
     
     text = update.message.text.strip()
@@ -497,31 +457,20 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🔄 **Verifying code...**")
     
-    result = await forwarder.verify_code(user_id, text)
+    result = await manager.verify_code(text, user_id)
     
     if result["status"] == "success":
         await update.message.reply_text(
             f"✅ **Login successful!**\n\n"
             f"Welcome, {result['user']}!\n\n"
-            f"Fetching your channels...",
+            f"Use `/refresh` to fetch your channels.",
             parse_mode='Markdown'
         )
-        
-        await forwarder.start_scanner()
-        
-        channels = await forwarder.fetch_channels()
-        if channels:
-            clear_channels()
-            for ch in channels:
-                add_channel(ch['id'], ch['name'], enabled=True)
-            await show_channel_selector(update, channels)
-        else:
-            await update.message.reply_text("📭 No channels found.")
-        
-        login_states.pop(user_id, None)
+        await manager.start_scanner()
+        user_states.pop(user_id, None)
         
     elif result["status"] == "password_needed":
-        login_states[user_id] = {"step": "password"}
+        user_states[user_id] = {"step": "password"}
         await update.message.reply_text(
             "🔐 **2FA Enabled**\n\n"
             "Enter your Telegram password:",
@@ -532,112 +481,34 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in login_states or login_states.get(user_id, {}).get("step") != "password":
+    if user_id not in user_states or user_states.get(user_id, {}).get("step") != "password":
         return
     
     password = update.message.text.strip()
     
     await update.message.reply_text("🔄 **Verifying password...**")
     
-    result = await forwarder.verify_password(user_id, password)
+    result = await manager.verify_password(password, user_id)
     
     if result["status"] == "success":
         await update.message.reply_text(
             f"✅ **Login successful!**\n\n"
             f"Welcome, {result['user']}!\n\n"
-            f"Fetching your channels...",
+            f"Use `/refresh` to fetch your channels.",
             parse_mode='Markdown'
         )
-        
-        await forwarder.start_scanner()
-        
-        channels = await forwarder.fetch_channels()
-        if channels:
-            clear_channels()
-            for ch in channels:
-                add_channel(ch['id'], ch['name'], enabled=True)
-            await show_channel_selector(update, channels)
-        else:
-            await update.message.reply_text("📭 No channels found.")
-        
-        login_states.pop(user_id, None)
+        await manager.start_scanner()
+        user_states.pop(user_id, None)
     else:
         await update.message.reply_text(f"❌ {result.get('message', 'Wrong password')}")
 
-async def show_channel_selector(update: Update, channels: List[dict]):
-    keyboard = []
-    for ch in channels:
-        status = "✅" if ch.get("enabled", True) else "⏸️"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{status} {ch['name'][:35]}",
-                callback_data=f"toggle_{ch['id']}"
-            )
-        ])
-    
-    keyboard.append([InlineKeyboardButton("✅ Confirm", callback_data="confirm")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"📋 **Select Channels to Monitor**\n\n"
-        f"Found {len(channels)} channels.\n"
-        f"Tap to toggle on/off.\n\n"
-        f"✅ = Active | ⏸️ = Disabled",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def show_main_menu(update: Update):
-    channels = load_channels()
-    enabled = len([ch for ch in channels if ch.get("enabled", False)])
-    
-    msg = (
-        f"✅ **Forwarder Active**\n\n"
-        f"📡 **Channels:** {enabled}/{len(channels)} active\n"
-        f"📁 **Scan:** every {SCAN_INTERVAL // 60} min\n\n"
-        f"**Commands:**\n"
-        f"/channels - Manage channels\n"
-        f"/refresh - Fetch channels\n"
-        f"/status - View stats\n"
-        f"/scan - Manual scan\n"
-        f"/logout - Log out"
-    )
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not forwarder or not forwarder.client:
-        await update.message.reply_text("❌ Not logged in. Use /login +977XXXXXXXXX")
-        return
-    
-    channels = load_channels()
-    if not channels:
-        await update.message.reply_text("📭 No channels. Use /refresh to fetch.")
-        return
-    
-    keyboard = []
-    for ch in channels:
-        status = "✅" if ch.get("enabled", False) else "⏸️"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{status} {ch['name'][:35]}",
-                callback_data=f"toggle_{ch['id']}"
-            )
-        ])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "📋 **Your Channels**\n\nTap to toggle:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
 async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not forwarder or not forwarder.client:
-        await update.message.reply_text("❌ Not logged in. Use /login +977XXXXXXXXX")
+    if not manager or not manager.client:
+        await update.message.reply_text("❌ Not logged in. Use `/login` first.", parse_mode='Markdown')
         return
     
-    await update.message.reply_text("🔄 Fetching channels...")
-    channels = await forwarder.fetch_channels()
+    await update.message.reply_text("🔄 Fetching your channels...")
+    channels = await manager.fetch_channels()
     
     if channels:
         clear_channels()
@@ -656,16 +527,39 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"📋 Found {len(channels)} channels.\n\nTap to toggle:",
+            f"📋 Found {len(channels)} channels.\n\nTap to toggle monitoring:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("❌ No channels found.")
 
+async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels = load_channels()
+    if not channels:
+        await update.message.reply_text("📭 No channels. Use `/refresh` to fetch.", parse_mode='Markdown')
+        return
+    
+    keyboard = []
+    for ch in channels:
+        status = "✅" if ch.get("enabled", True) else "⏸️"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {ch['name'][:35]}",
+                callback_data=f"toggle_{ch['id']}"
+            )
+        ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "📋 **Your Channels**\n\nTap to toggle monitoring:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not forwarder or not forwarder.client:
-        await update.message.reply_text("❌ Not logged in. Use /login +977XXXXXXXXX")
+    if not manager or not manager.client:
+        await update.message.reply_text("❌ Not logged in. Use `/login` first.", parse_mode='Markdown')
         return
     
     channels = load_channels()
@@ -681,30 +575,47 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = (
         f"📊 **Status**\n\n"
-        f"📡 Active Channels: {enabled}\n"
-        f"📁 Files Forwarded: {total} total, {today} today\n"
-        f"⏱️ Scan: every {SCAN_INTERVAL // 60} min"
+        f"📡 **Active Channels:** {enabled}/{len(channels)}\n"
+        f"📁 **Files Forwarded:** {total} total, {today} today\n"
+        f"⏱️ **Scan Interval:** {SCAN_INTERVAL // 60} minutes"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not forwarder or not forwarder.client:
-        await update.message.reply_text("❌ Not logged in")
+    if not manager or not manager.client:
+        await update.message.reply_text("❌ Not logged in", parse_mode='Markdown')
         return
     
     await update.message.reply_text("🔄 Manual scan triggered...")
-    asyncio.create_task(forwarder.manual_scan())
+    asyncio.create_task(manager.manual_scan())
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global forwarder
-    if forwarder:
-        await forwarder.shutdown()
+    global manager
+    if manager:
+        await manager.shutdown()
     if os.path.exists(SESSION_FILE):
         os.remove(SESSION_FILE)
     clear_channels()
-    forwarder = None
-    login_states.clear()
-    await update.message.reply_text("✅ Logged out")
+    manager = None
+    user_states.clear()
+    await update.message.reply_text("✅ **Logged out**\n\nUse `/login` to log in again.", parse_mode='Markdown')
+
+async def show_main_menu(update: Update):
+    channels = load_channels()
+    enabled = len([ch for ch in channels if ch.get("enabled", False)])
+    
+    msg = (
+        f"✅ **Forwarder Active**\n\n"
+        f"📡 **Channels:** {enabled}/{len(channels)} active\n"
+        f"📁 **Scan:** every {SCAN_INTERVAL // 60} minutes\n\n"
+        f"**Commands:**\n"
+        f"/refresh - Fetch channels\n"
+        f"/channels - Manage channels\n"
+        f"/status - View stats\n"
+        f"/scan - Manual scan\n"
+        f"/logout - Log out"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -729,21 +640,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def main():
-    global forwarder
+    global manager
     
     init_db()
     
-    forwarder = TelegramForwarder()
-    if await forwarder.load_existing_session():
-        await forwarder.start_scanner()
+    manager = TelegramClientManager()
+    if await manager.load_session():
+        await manager.start_scanner()
         logger.info("✅ Existing session loaded")
     
     app = Application.builder().token(CONTROL_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CommandHandler("cancel", cancel_login))
-    app.add_handler(CommandHandler("channels", channels_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    app.add_handler(CommandHandler("channels", channels_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
@@ -754,8 +665,7 @@ async def main():
     print("\n" + "="*60)
     print("🤖 TELEGRAM TXT FILE FORWARDER")
     print("="*60)
-    print(f"Bot is running!")
-    print(f"Proxy: {'Enabled' if PROXY else 'Disabled'}")
+    print("Bot is running!")
     print("Send /login +977XXXXXXXXX to start")
     print("="*60 + "\n")
     
@@ -769,8 +679,8 @@ async def main():
         pass
     finally:
         await app.stop()
-        if forwarder:
-            await forwarder.shutdown()
+        if manager:
+            await manager.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
